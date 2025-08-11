@@ -1,0 +1,264 @@
+"""
+AI-based-SDG-Tracker-for-Environmental-Goals (Synthetic Data)
+Author: Amos Meremu Dogiye
+GitHub: https://github.com/GTVSOFT
+
+Generates synthetic spatial-temporal environmental indicator data (>>100 points),
+computes SDG composite scores, trains ML models (regressor + classifier),
+evaluates them, and exports the dataset to Excel.
+"""
+
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    roc_auc_score,
+    classification_report,
+    mean_squared_error,
+    r2_score,
+)
+import matplotlib.pyplot as plt
+import joblib
+import os
+
+# ---------------- User settings ----------------
+NUM_LOCATIONS = 150           # distinct spatial locations
+TIMESTEPS_PER_LOCATION = 4    # how many time samples (e.g., quarterly) per location
+RANDOM_SEED = 2025
+EXPORT_DIR = "output"
+EXPORT_EXCEL = True
+SAVE_MODELS = True
+
+np.random.seed(RANDOM_SEED)
+
+# ---------------- Synthetic domain definition ----------------
+# Spatial bounding box (example): lon [34.8, 35.2], lat [-1.5, -1.1]
+lon_min, lon_max = 34.8, 35.2
+lat_min, lat_max = -1.5, -1.1
+
+# Time series starting date
+start_date = datetime(2024, 1, 1)
+
+# ---------------- Create synthetic dataset ----------------
+rows = []
+for loc_id in range(1, NUM_LOCATIONS + 1):
+    # random static properties per location
+    lon = np.random.uniform(lon_min, lon_max)
+    lat = np.random.uniform(lat_min, lat_max)
+    elevation = np.random.normal(500, 120)  # meters (synthetic)
+    urban_frac = np.clip(np.random.beta(2, 5), 0, 1)  # fraction urban (0..1)
+    for t in range(TIMESTEPS_PER_LOCATION):
+        timestamp = start_date + timedelta(days=90 * t)  # quarterly-ish
+        # Generate synthetic indicators with plausible relationships:
+        # Air quality (AQI-like): worse in high urban_frac and lower vegetation
+        vegetation_index = np.clip(np.random.normal(0.6 - 0.4 * urban_frac, 0.12), 0, 1)
+        aqi = np.clip(
+            40 + 80 * urban_frac + np.random.normal(0, 10) - 20 * vegetation_index,
+            10,
+            300,
+        )  # 10..300
+        # Water quality index: worse near lower elevation & higher urban_frac
+        water_quality = np.clip(80 - 30 * urban_frac - 0.01 * (500 - elevation) + np.random.normal(0, 8), 0, 100)
+        # Forest cover percent: lower in urban areas
+        forest_cover = np.clip(60 * (1 - urban_frac) + np.random.normal(0, 10), 0, 100)
+        # Waste management score (0-100): correlated with urban_frac but with variation
+        waste_mgmt = np.clip(50 + 30 * urban_frac + np.random.normal(0, 12), 0, 100)
+        # Renewable energy penetration (0-100): random with slight positive correlation to elevation
+        renewable_pct = np.clip(10 + 0.02 * elevation + np.random.normal(0, 8), 0, 100)
+
+        rows.append(
+            {
+                "loc_id": loc_id,
+                "timestamp": timestamp.strftime("%Y-%m-%d"),
+                "longitude": lon,
+                "latitude": lat,
+                "elevation_m": elevation,
+                "urban_frac": urban_frac,
+                "vegetation_index": vegetation_index,
+                "aqi": aqi,
+                "water_quality": water_quality,
+                "forest_cover_pct": forest_cover,
+                "waste_mgmt_score": waste_mgmt,
+                "renewable_pct": renewable_pct,
+            }
+        )
+
+df = pd.DataFrame(rows)
+
+# ---------------- Compute composite SDG score and label ----------------
+# Composite: weighted sum of normalized indicator contributions.
+# Higher composite -> better performance on environmental SDGs.
+# We normalize indicators into 0..1 and weight them.
+
+def minmax_series(s):
+    return (s - s.min()) / (s.max() - s.min() + 1e-9)
+
+
+# normalize individual indicators to 0..1 on desirable direction (higher better)
+df["aqi_norm"] = 1 - minmax_series(df["aqi"])  # lower AQI is better -> invert
+df["water_q_norm"] = minmax_series(df["water_quality"])
+df["forest_norm"] = df["forest_cover_pct"] / 100.0
+df["waste_norm"] = minmax_series(df["waste_mgmt_score"])
+df["renewable_norm"] = df["renewable_pct"] / 100.0
+df["vegetation_norm"] = df["vegetation_index"]  # already 0..1
+
+# Example weights reflecting relative SDG priorities (customizable)
+weights = {
+    "aqi_norm": 0.22,
+    "water_q_norm": 0.20,
+    "forest_norm": 0.20,
+    "waste_norm": 0.18,
+    "renewable_norm": 0.12,
+    "vegetation_norm": 0.08,
+}
+
+# compute composite in 0..1
+df["sdg_composite"] = (
+    df["aqi_norm"] * weights["aqi_norm"]
+    + df["water_q_norm"] * weights["water_q_norm"]
+    + df["forest_norm"] * weights["forest_norm"]
+    + df["waste_norm"] * weights["waste_norm"]
+    + df["renewable_norm"] * weights["renewable_norm"]
+    + df["vegetation_norm"] * weights["vegetation_norm"]
+)
+
+# Define 'at_risk' label if composite < threshold (customizable)
+RISK_THRESHOLD = 0.45
+df["at_risk"] = (df["sdg_composite"] < RISK_THRESHOLD).astype(int)
+
+# ---------------- Quick sanity and counts ----------------
+print("Total samples:", len(df))
+print("Unique locations:", df["loc_id"].nunique())
+print("At-risk count:", df["at_risk"].sum(), "({:.1f}%)".format(100 * df["at_risk"].mean()))
+
+# ---------------- Prepare features for ML ----------------
+feature_cols = [
+    "longitude",
+    "latitude",
+    "elevation_m",
+    "urban_frac",
+    "vegetation_index",
+    "aqi",
+    "water_quality",
+    "forest_cover_pct",
+    "waste_mgmt_score",
+    "renewable_pct",
+]
+
+X = df[feature_cols].values
+y_class = df["at_risk"].values
+y_reg = df["sdg_composite"].values
+
+# train/test split
+X_train, X_test, yc_train, yc_test, yr_train, yr_test = train_test_split(
+    X, y_class, y_reg, test_size=0.2, random_state=RANDOM_SEED, stratify=y_class
+)
+
+# ---------------- Classification: At-risk prediction ----------------
+clf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
+clf.fit(X_train, yc_train)
+yc_pred = clf.predict(X_test)
+yc_prob = clf.predict_proba(X_test)[:, 1]
+
+print("\nClassification results (At-risk):")
+print("Accuracy:", accuracy_score(yc_test, yc_pred))
+print("F1-score:", f1_score(yc_test, yc_pred))
+try:
+    print("ROC-AUC:", roc_auc_score(yc_test, yc_prob))
+except Exception:
+    print("ROC-AUC: could not compute (single-class in test or degenerate)")
+
+print("\nClassification report:\n", classification_report(yc_test, yc_pred))
+
+# feature importances
+importances = clf.feature_importances_
+feat_imp = pd.Series(importances, index=feature_cols).sort_values(ascending=False)
+print("\nFeature importances (classification):")
+print(feat_imp.to_string())
+
+# ---------------- Regression: Predict composite score ----------------
+reg = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED, n_jobs=-1)
+reg.fit(X_train, yr_train)
+yr_pred = reg.predict(X_test)
+
+rmse = np.sqrt(mean_squared_error(yr_test, yr_pred))
+r2 = r2_score(yr_test, yr_pred)
+print("\nRegression results (SDG composite):")
+print("RMSE:", round(rmse, 4))
+print("R2:", round(r2, 4))
+
+reg_imp = pd.Series(reg.feature_importances_, index=feature_cols).sort_values(ascending=False)
+print("\nFeature importances (regression):")
+print(reg_imp.to_string())
+
+# ---------------- Cross-validation (optional) ----------------
+cv_scores = cross_val_score(clf, X, y_class, cv=5, scoring="accuracy", n_jobs=-1)
+print("\nCross-validated classification accuracy (5-fold): {:.3f} ± {:.3f}".format(cv_scores.mean(), cv_scores.std()))
+
+# ---------------- Export dataset and models ----------------
+os.makedirs(EXPORT_DIR, exist_ok=True)
+if EXPORT_EXCEL:
+    excel_path = os.path.join(EXPORT_DIR, "synthetic_sdg_dataset.xlsx")
+    # choose columns to save
+    save_cols = [
+        "loc_id",
+        "timestamp",
+        "longitude",
+        "latitude",
+        "elevation_m",
+        "urban_frac",
+        "vegetation_index",
+        "aqi",
+        "water_quality",
+        "forest_cover_pct",
+        "waste_mgmt_score",
+        "renewable_pct",
+        "sdg_composite",
+        "at_risk",
+    ]
+    df[save_cols].to_excel(excel_path, index=False)
+    print("\nSaved synthetic dataset to:", excel_path)
+
+if SAVE_MODELS:
+    clf_path = os.path.join(EXPORT_DIR, "sdg_atrisk_classifier.joblib")
+    reg_path = os.path.join(EXPORT_DIR, "sdg_composite_regressor.joblib")
+    joblib.dump(clf, clf_path)
+    joblib.dump(reg, reg_path)
+    print("Saved classifier to:", clf_path)
+    print("Saved regressor to:", reg_path)
+
+# ---------------- Simple plots (optional) ----------------
+try:
+    plt.figure(figsize=(8, 4))
+    plt.hist(df["sdg_composite"], bins=30, edgecolor="k")
+    plt.title("Distribution of SDG Composite Scores (synthetic)")
+    plt.xlabel("Composite score (0-1)")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.savefig(os.path.join(EXPORT_DIR, "sdg_composite_histogram.png"))
+    plt.close()
+
+    # scatter map of composite vs urban_frac
+    plt.figure(figsize=(6, 5))
+    plt.scatter(df["urban_frac"], df["sdg_composite"], alpha=0.6)
+    plt.xlabel("Urban fraction")
+    plt.ylabel("SDG composite score")
+    plt.title("Composite vs Urban fraction")
+    plt.tight_layout()
+    plt.savefig(os.path.join(EXPORT_DIR, "composite_vs_urban_frac.png"))
+    plt.close()
+
+    print("\nSaved simple diagnostic plots to the output folder.")
+except Exception as e:
+    print("Plotting skipped due to error:", e)
+
+# ---------------- Summary ----------------
+print("\n--- Summary ---")
+print("Samples:", len(df))
+print("Locations:", df['loc_id'].nunique())
+print("At-risk proportion: {:.2f}%".format(100 * df["at_risk"].mean()))
+print("Output folder:", os.path.abspath(EXPORT_DIR))
